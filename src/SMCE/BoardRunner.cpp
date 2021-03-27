@@ -34,6 +34,7 @@ __declspec(dllimport) LONG NTAPI NtSuspendProcess(HANDLE ProcessHandle);
 #error "Unsupported platform"
 #endif
 
+#include <atomic>
 #include <ctime>
 #include <string>
 #include <type_traits>
@@ -58,7 +59,8 @@ enum class BoardRunner::Command {
 };
 
 struct BoardRunner::Internal {
-    std::uint64_t sketch_id = std::time(nullptr);
+    static inline std::atomic_uint64_t last_id = std::time(nullptr);
+    std::uint64_t sketch_id = ++last_id;
     SharedBoardData sbdata;
     bp::child sketch;
     bp::ipstream sketch_log;
@@ -125,6 +127,7 @@ bool BoardRunner::reset() noexcept {
         m_internal = std::make_unique<Internal>();
         if (!m_sketch_dir.empty())
             stdfs::remove_all(m_sketch_dir);
+        m_sketch_path.clear();
         m_sketch_dir.clear();
         m_sketch_bin.clear();
         m_build_log.clear();
@@ -134,13 +137,15 @@ bool BoardRunner::reset() noexcept {
     }
 }
 
-bool BoardRunner::configure(std::string_view pp_fqbn, const BoardConfig& bconf) noexcept {
+bool BoardRunner::configure(std::string_view pp_fqbn, BoardConfig bconf) noexcept {
     if (!(m_status == Status::clean || m_status == Status::configured))
         return false;
 
     namespace bp = boost::process;
 
     m_internal->sbdata.configure("SMCE-Runner-" + std::to_string(m_internal->sketch_id), pp_fqbn, bconf);
+    m_bconf = std::move(bconf);
+    m_fqbn = pp_fqbn;
     m_status = Status::configured;
     return true;
 }
@@ -154,7 +159,8 @@ bool BoardRunner::build(const stdfs::path& sketch_src, const SketchConfig& skonf
     const char* const generator = generator_override ? generator_override : (!bp::search_path("ninja").empty() ? "Ninja" : "");
 #endif
     std::string dir_arg = "-DSMCE_DIR=" + res_path.string();
-    std::string fqbn_arg = "-DSKETCH_FQBN="s + m_internal->sbdata.get_board_data()->fqbn.c_str();
+    std::string fqbn_arg = "-DSKETCH_FQBN=" + m_fqbn;
+    std::string ident_arg = "-DSKETCH_IDENT=" + std::to_string(m_internal->sketch_id);
     std::string sketch_arg = "-DSKETCH_PATH=" + stdfs::absolute(sketch_src).generic_string();
     std::string pp_remote_libs_arg = "-DPREPROC_REMOTE_LIBS=";
     std::string cl_remote_libs_arg = "-DCOMPLINK_REMOTE_LIBS=";
@@ -209,6 +215,7 @@ bool BoardRunner::build(const stdfs::path& sketch_src, const SketchConfig& skonf
 #if !BOOST_OS_WINDOWS
         bp::env["CMAKE_GENERATOR"] = generator,
 #endif
+        std::move(ident_arg),
         std::move(dir_arg),
         std::move(fqbn_arg),
         std::move(sketch_arg),
@@ -249,27 +256,44 @@ bool BoardRunner::build(const stdfs::path& sketch_src, const SketchConfig& skonf
     if (cmake_config.native_exit_code() != 0)
         return false;
 
-    bp::ipstream cmake_build_out;
-    auto cmake_build = bp::child {
-#if BOOST_OS_WINDOWS
-        bp::env["MSBUILDDISABLENODEREUSE"] = "1", // MSBuild "feature" which uses your child processes as potential deamons, forever
-#endif
-        cmake_path, "--build", (m_sketch_dir / "build").string(), (bp::std_out & bp::std_err) > cmake_build_out
+    m_sketch_path = sketch_src;
+
+    return do_build();
+}
+
+bool BoardRunner::rebuild() noexcept {
+    if (m_sketch_path.empty()
+        || m_status == Status::running
+        || m_status == Status::suspended)
+        return false;
+
+    m_internal->sbdata.reset();
+    m_internal->sbdata.configure("SMCE-Runner-" + std::to_string(m_internal->sketch_id), m_fqbn, m_bconf);
+
+    const auto& res_path = m_exectx.resource_dir();
+
+    bp::ipstream cmake_conf_out;
+    auto cmake_config = bp::child{
+        m_exectx.cmake_path(),
+        "-DSMCE_DIR=" + res_path.string(),
+        "-DSKETCH_IDENT=" + std::to_string(m_internal->sketch_id),
+        "-DSKETCH_FQBN=" + m_fqbn,
+        "-DSKETCH_PATH=" + stdfs::absolute(m_sketch_path).generic_string(),
+        "-P",
+        res_path.string() + "/RtResources/SMCE/share/Scripts/ConfigureSketch.cmake",
+        (bp::std_out & bp::std_err) > cmake_conf_out
     };
 
-    for (std::string line; std::getline(cmake_build_out, line);) {
+    for (std::string line; std::getline(cmake_conf_out, line);) {
         [[maybe_unused]] std::lock_guard lk{m_build_log_mtx};
         (m_build_log += line) += '\n';
     }
 
-    cmake_build.join();
-    if (cmake_build.native_exit_code() != 0  || !stdfs::exists(m_sketch_bin))
+    cmake_config.join();
+    if (cmake_config.native_exit_code() != 0)
         return false;
 
-    std::error_code ec;
-
-    m_status = Status::built;
-    return !static_cast<bool>(ec);
+    return do_build();
 }
 
 bool BoardRunner::start() noexcept {
@@ -340,6 +364,10 @@ bool BoardRunner::terminate() noexcept {
 
     std::error_code ec;
     m_internal->sketch.terminate(ec);
+
+    if (m_internal->sketch_log_grabber.joinable())
+        m_internal->sketch_log_grabber.join();
+
     if (!ec)
         m_status = Status::stopped;
     return !ec;
@@ -366,5 +394,29 @@ bool BoardRunner::stop() noexcept {
 // FIXME
 bool BoardRunner::stop() noexcept { return terminate(); }
 
+bool BoardRunner::do_build() noexcept {
+    bp::ipstream cmake_build_out;
+    auto cmake_build = bp::child{
+#if BOOST_OS_WINDOWS
+        bp::env["MSBUILDDISABLENODEREUSE"] = "1", // MSBuild "feature" which uses your child processes as potential deamons, forever
+#endif
+        m_exectx.cmake_path(),
+        "--build",
+        (m_sketch_dir / "build").string(),
+        (bp::std_out & bp::std_err) > cmake_build_out
+    };
+
+    for (std::string line; std::getline(cmake_build_out, line);) {
+        [[maybe_unused]] std::lock_guard lk{m_build_log_mtx};
+        (m_build_log += line) += '\n';
+    }
+
+    cmake_build.join();
+    if (cmake_build.native_exit_code() != 0  || !stdfs::exists(m_sketch_bin))
+        return false;
+
+    m_status = Status::built;
+    return true;
+}
 
 }

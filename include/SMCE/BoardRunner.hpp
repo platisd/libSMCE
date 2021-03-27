@@ -52,8 +52,9 @@ class BoardRunner {
     void tick() noexcept;
 
     bool reset() noexcept;
-    bool configure(std::string_view pp_fqbn, const BoardConfig& bconf) noexcept;
+    bool configure(std::string_view pp_fqbn, BoardConfig bconf) noexcept;
     bool build(const stdfs::path& sketch_src, const SketchConfig& skonf) noexcept;
+    bool rebuild() noexcept;
     bool start() noexcept;
     bool suspend() noexcept;
     bool resume() noexcept;
@@ -67,8 +68,13 @@ class BoardRunner {
     struct Internal;
     enum class Command;
 
+    bool do_build() noexcept;
+
     ExecutionContext& m_exectx;
     Status m_status{};
+    BoardConfig m_bconf;
+    std::string m_fqbn;
+    stdfs::path m_sketch_path;
     stdfs::path m_sketch_dir;
     stdfs::path m_sketch_bin;
     std::string m_build_log;
