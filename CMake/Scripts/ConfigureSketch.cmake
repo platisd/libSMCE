@@ -17,13 +17,14 @@
 
 ## Expected variables
 # SMCE_DIR - Path to the SMCE dir
+# SKETCH_IDENT - Unique sketch identifier
 # SKETCH_FQBN - Fully qualified board name to use
-# SKETCH_PATH - Path to the Arduino sketch
+# SKETCH_PATH - Path to the Arduino sketch file
 # PREPROC_REMOTE_LIBS - whitespace-separated of remote libs to pull for preprocessing
 # COMPLINK_REMOTE_LIBS - remote libs needed at compile/link-time
 # COMPLINK_PATCH_LIBS - remote libs to patch for compile/link-time
 
-cmake_policy (SET CMP0011 NEW)
+cmake_policy (SET CMP0011 NEW) # Included scripts do automatic cmake_policy() PUSH and POP.
 
 set (MODULES_DIR "${SMCE_DIR}/RtResources/CMake/Modules")
 list (APPEND CMAKE_MODULE_PATH "${MODULES_DIR}")
@@ -68,38 +69,41 @@ elseif (NOT EXISTS "${ARDCLI_CONFIG_USERDIR}")
     message (WARNING "ArduinoCLI userdir could not be found on disk (\"${ARDCLI_CONFIG_USERDIR}\")")
 endif ()
 
-string (RANDOM LENGTH 13 COMP_DIRNAME)
-set (COMP_DIR "${SMCE_DIR}/tmp/${COMP_DIRNAME}")
+if (NOT SKETCH_IDENT)
+    string (RANDOM LENGTH 13 SKETCH_IDENT)
+endif ()
+
+set (COMP_DIR "${SMCE_DIR}/tmp/${SKETCH_IDENT}")
 file (MAKE_DIRECTORY "${COMP_DIR}")
 message (STATUS "SMCE: Compilation directory is \"${COMP_DIR}\"")
 
-file (MAKE_DIRECTORY "${COMP_DIR}/libs")
-foreach (COMPLINK_PATCH_LIB ${COMPLINK_PATCH_LIBS})
-    string (REGEX MATCH "^([^|]+)\\|([^@]*)(@?[0-9.]*)$" MATCH "${COMPLINK_PATCH_LIB}")
-    if(NOT MATCH)
-        message (FATAL_ERROR "Invalid COMPLINK_PATCH_LIB (\"${COMPLINK_PATCH_LIB}\")")
-    endif ()
-    set (COMPLINK_PATCH_LIB_PATH "${CMAKE_MATCH_1}")
-    string (REPLACE " " "_" COMPLINK_PATCH_LIB_TARGET "${CMAKE_MATCH_2}")
-
-    message (STATUS "Processing library \"${COMPLINK_PATCH_LIB_TARGET}\" (patched by \"${COMPLINK_PATCH_LIB_PATH}\")")
-    # Copy original library
-    file (COPY "${ARDCLI_CONFIG_USERDIR}/libraries/${COMPLINK_PATCH_LIB_TARGET}" DESTINATION "${COMP_DIR}/libs")
-
-    # Merge-in the patch tree
-    file (GLOB_RECURSE COMPLINK_PATCH_LIB_FILEPATHS
-            LIST_DIRECTORIES false RELATIVE "${COMPLINK_PATCH_LIB_PATH}"
-            "${COMPLINK_PATCH_LIB_PATH}/*")
-    foreach (COMPLINK_PATCH_LIB_RELFILEPATH ${COMPLINK_PATCH_LIB_FILEPATHS})
-        if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.20")
-            cmake_path (GET COMPLINK_PATCH_LIB_RELFILEPATH PARENT_PATH COMPLINK_PATCH_LIB_RELFILEDIR)
-        else ()
-            get_filename_component (COMPLINK_PATCH_LIB_RELFILEDIR "${COMPLINK_PATCH_LIB_RELFILEPATH}" DIRECTORY)
-        endif()
-        file (MAKE_DIRECTORY "${COMP_DIR}/libs/${COMPLINK_PATCH_LIB_TARGET}/${COMPLINK_PATCH_LIB_RELFILEDIR}")
-        file (COPY "${COMPLINK_PATCH_LIB_PATH}/${COMPLINK_PATCH_LIB_RELFILEPATH}" DESTINATION "${COMP_DIR}/libs/${COMPLINK_PATCH_LIB_TARGET}/${COMPLINK_PATCH_LIB_RELFILEDIR}")
-    endforeach ()
+# Acquire source information
+if (${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.20")
+    cmake_path (GET SKETCH_PATH PARENT_PATH SKETCH_DIR)
+else ()
+    get_filename_component (SKETCH_DIR "${SKETCH_PATH}" DIRECTORY)
+endif ()
+file (GLOB SKETCH_SOURCES LIST_DIRECTORIES false "${SKETCH_DIR}/*.ino" "${SKETCH_DIR}/*.pde")
+set (SKETCH_BUILDINFO "Sources:\n")
+foreach (SKETCH_SOURCE ${SKETCH_SOURCES})
+    file (TIMESTAMP "${SKETCH_SOURCE}" SKETCH_SOURCE_MTIME)
+    file (SHA512 "${SKETCH_SOURCE}" SKETCH_SOURCE_SHA512)
+    string (APPEND SKETCH_BUILDINFO "${SKETCH_SOURCE} | ${SKETCH_SOURCE_MTIME} | ${SKETCH_SOURCE_SHA512}\n")
 endforeach ()
+
+# Load previous source information
+set (BUILDINFO_PATH "${COMP_DIR}/smce_buildinfo.txt")
+if (EXISTS "${BUILDINFO_PATH}")
+    file (READ "${BUILDINFO_PATH}" SKETCH_PREV_INFO)
+    if (SKETCH_BUILDINFO STREQUALS SKETCH_PREV_INFO)
+        message (STATUS "Sources have not changed; not running configure again")
+        message (STATUS "SMCE: Sketch binary will be at \"${COMP_DIR}/build/Sketch\"")
+        return ()
+    endif ()
+    set (FRESH_BUILD False)
+else ()
+    set (FRESH_BUILD True)
+endif ()
 
 cmaw_preprocess (PREPROCD_SKETCH "${SKETCH_FQBN}" "${SKETCH_PATH}")
 if ("${PREPROCD_SKETCH}" STREQUAL "")
@@ -108,8 +112,40 @@ endif ()
 set (COMP_SRC "${COMP_DIR}/sketch.cpp")
 file (WRITE "${COMP_SRC}" "${PREPROCD_SKETCH}")
 
-file (COPY "${SMCE_DIR}/RtResources/SMCE/share/Runtime/CMakeLists.txt" DESTINATION "${COMP_DIR}")
-file (MAKE_DIRECTORY "${COMP_DIR}/build")
-execute_process (COMMAND "${CMAKE_COMMAND}" "-DSMCE_DIR=${SMCE_DIR}" -S "${COMP_DIR}" -B "${COMP_DIR}/build")
+if (FRESH_BUILD)
+    # Handle libraries
+    file (MAKE_DIRECTORY "${COMP_DIR}/libs")
+    foreach (COMPLINK_PATCH_LIB ${COMPLINK_PATCH_LIBS})
+        string (REGEX MATCH "^([^|]+)\\|([^@]*)(@?[0-9.]*)$" MATCH "${COMPLINK_PATCH_LIB}")
+        if(NOT MATCH)
+            message (FATAL_ERROR "Invalid COMPLINK_PATCH_LIB (\"${COMPLINK_PATCH_LIB}\")")
+        endif ()
+        set (COMPLINK_PATCH_LIB_PATH "${CMAKE_MATCH_1}")
+        string (REPLACE " " "_" COMPLINK_PATCH_LIB_TARGET "${CMAKE_MATCH_2}")
+
+        message (STATUS "Processing library \"${COMPLINK_PATCH_LIB_TARGET}\" (patched by \"${COMPLINK_PATCH_LIB_PATH}\")")
+        # Copy original library
+        file (COPY "${ARDCLI_CONFIG_USERDIR}/libraries/${COMPLINK_PATCH_LIB_TARGET}" DESTINATION "${COMP_DIR}/libs")
+
+        # Merge-in the patch tree
+        file (GLOB_RECURSE COMPLINK_PATCH_LIB_FILEPATHS
+                LIST_DIRECTORIES false RELATIVE "${COMPLINK_PATCH_LIB_PATH}"
+                "${COMPLINK_PATCH_LIB_PATH}/*")
+        foreach (COMPLINK_PATCH_LIB_RELFILEPATH ${COMPLINK_PATCH_LIB_FILEPATHS})
+            if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.20")
+                cmake_path (GET COMPLINK_PATCH_LIB_RELFILEPATH PARENT_PATH COMPLINK_PATCH_LIB_RELFILEDIR)
+            else ()
+                get_filename_component (COMPLINK_PATCH_LIB_RELFILEDIR "${COMPLINK_PATCH_LIB_RELFILEPATH}" DIRECTORY)
+            endif()
+            file (MAKE_DIRECTORY "${COMP_DIR}/libs/${COMPLINK_PATCH_LIB_TARGET}/${COMPLINK_PATCH_LIB_RELFILEDIR}")
+            file (COPY "${COMPLINK_PATCH_LIB_PATH}/${COMPLINK_PATCH_LIB_RELFILEPATH}" DESTINATION "${COMP_DIR}/libs/${COMPLINK_PATCH_LIB_TARGET}/${COMPLINK_PATCH_LIB_RELFILEDIR}")
+        endforeach ()
+    endforeach ()
+
+    # CMake Configure
+    file (COPY "${SMCE_DIR}/RtResources/SMCE/share/Runtime/CMakeLists.txt" DESTINATION "${COMP_DIR}")
+    file (MAKE_DIRECTORY "${COMP_DIR}/build")
+    execute_process (COMMAND "${CMAKE_COMMAND}" "-DSMCE_DIR=${SMCE_DIR}" -S "${COMP_DIR}" -B "${COMP_DIR}/build")
+endif ()
 
 message (STATUS "SMCE: Sketch binary will be at \"${COMP_DIR}/build/Sketch\"")
