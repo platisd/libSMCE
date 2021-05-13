@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string_view>
 #include <variant>
 #include <SMCE/BoardView.hpp>
 #include "SMCE_dll.hpp"
@@ -30,6 +31,7 @@ extern BoardView board_view;
 extern void maybe_init();
 }
 
+using namespace std::literals;
 using namespace smce;
 
 class SMCE_SDImpl : public SDClass {
@@ -334,12 +336,18 @@ bool SDClass::mkdir(const char* path) {
     if(path_len == 0)
         return false;
 
+    if(path == "/"sv)
+        return false;
+
     return std::filesystem::create_directories(SMCE_SDimpl.root() / (path[0] == '/' ? path + 1 : path));
 }
 
 bool SDClass::rmdir(const char* path) {
     const auto path_len = std::strlen(path);
     if(path_len == 0)
+        return false;
+
+    if(path == "/"sv)
         return false;
 
     const auto fspath = SMCE_SDimpl.root() / (path[0] == '/' ? path + 1 : path);
