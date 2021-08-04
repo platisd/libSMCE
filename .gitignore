@@ -788,3 +788,5 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# Downloaded boost
+boost_*/
